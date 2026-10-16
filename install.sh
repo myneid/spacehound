@@ -1,7 +1,7 @@
 #!/bin/sh
 # SpaceHound installer for GitHub releases.
 #
-#   sh install.sh --version v0.1.0 [--prefix DIR] [--repo OWNER/NAME]
+#   sh install.sh --version v0.1.1 [--prefix DIR] [--repo OWNER/NAME]
 #
 # Downloads the darwin archive for this Mac and the release's SHA256SUMS,
 # verifies the checksum, and only then installs the binary. Nothing that is

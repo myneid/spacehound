@@ -48,7 +48,7 @@ This installs to `~/.local/bin`. If you prefer to inspect the installer first:
 ```sh
 curl -fsSLO https://github.com/myneid/spacehound/releases/latest/download/install.sh
 less install.sh                      # read it first
-sh install.sh --version v0.1.0       # installs to ~/.local/bin by default
+sh install.sh --version v0.1.1       # installs to ~/.local/bin by default
 ```
 
 The `install.sh` attached to each release and the copy in this source tree

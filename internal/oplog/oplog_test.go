@@ -187,6 +187,9 @@ func TestJournalRejectsHardLinks(t *testing.T) {
 	if err := os.WriteFile(target, []byte("untouched\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(target, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	dir := filepath.Join(base, "SpaceHound")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -281,6 +284,9 @@ func TestPendingDoesNotCreateOrChangeFiles(t *testing.T) {
 	if err := os.Mkdir(l.Dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(l.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := l.Pending(); err != nil {
 		t.Fatal(err)
 	}
@@ -289,6 +295,9 @@ func TestPendingDoesNotCreateOrChangeFiles(t *testing.T) {
 	}
 	b := []byte("{\"operation_id\":\"a\",\"phase\":\"intent\",\"path\":\"/a\",\"recovery_path\":\"/r/a\"}\n")
 	if err := os.WriteFile(l.Path(), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(l.Path(), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := l.Pending(); err != nil {
