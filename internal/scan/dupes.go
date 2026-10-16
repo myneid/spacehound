@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
+	"syscall"
 
 	"spacehound/internal/fsid"
+	"spacehound/internal/macosfs"
 	"spacehound/internal/model"
 	"spacehound/internal/units"
 )
@@ -46,11 +49,14 @@ func (c ctxReader) Read(p []byte) (int, error) {
 // Files that differ here cannot be identical; files that match still need a
 // full hash.
 func SampleHash(ctx context.Context, path string, size int64) (string, error) {
-	f, err := os.Open(path)
+	f, id, err := openHashFile(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	if id.Size != size {
+		return "", fmt.Errorf("%w: size changed before sampling", fsid.ErrChanged)
+	}
 	h := sha256.New()
 	var sz [8]byte
 	binary.LittleEndian.PutUint64(sz[:], uint64(size))
@@ -69,12 +75,15 @@ func SampleHash(ctx context.Context, path string, size int64) (string, error) {
 		}
 		h.Write(buf[:n])
 	}
+	if err := validateHashFile(f, path, id); err != nil {
+		return "", err
+	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // FullHash returns the SHA-256 of the entire file.
 func FullHash(ctx context.Context, path string, prog *Progress) (string, error) {
-	f, err := os.Open(path)
+	f, id, err := openHashFile(path)
 	if err != nil {
 		return "", err
 	}
@@ -83,7 +92,69 @@ func FullHash(ctx context.Context, path string, prog *Progress) (string, error) 
 	if _, err := io.Copy(h, ctxReader{ctx: ctx, r: f, prog: prog}); err != nil {
 		return "", err
 	}
+	if err := validateHashFile(f, path, id); err != nil {
+		return "", err
+	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// openHashFile rejects symlinks in every component and checks regular-file
+// type and cloud flags before obtaining a descriptor that can read contents.
+func openHashFile(path string) (*os.File, fsid.Identity, error) {
+	dir, err := macosfs.OpenDir(filepath.Dir(path), false, 0)
+	if err != nil {
+		return nil, fsid.Identity{}, err
+	}
+	defer dir.Close()
+	name := filepath.Base(path)
+	stat, err := macosfs.OpenAt(dir, name, syscall.O_EVTONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fsid.Identity{}, err
+	}
+	id, info, err := fsid.FromOpen(stat)
+	stat.Close()
+	if err != nil {
+		return nil, fsid.Identity{}, err
+	}
+	if err := fsid.Check(info, id); err != nil {
+		return nil, fsid.Identity{}, err
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && st.Flags&sfDataless != 0 {
+		return nil, fsid.Identity{}, fmt.Errorf("cloud placeholder (contents not downloaded)")
+	}
+	f, err := macosfs.OpenAt(dir, name, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fsid.Identity{}, err
+	}
+	_, info, err = fsid.FromOpen(f)
+	if err == nil {
+		err = fsid.Check(info, id)
+	}
+	if err != nil {
+		f.Close()
+		return nil, fsid.Identity{}, err
+	}
+	return f, id, nil
+}
+
+func validateHashFile(f *os.File, path string, want fsid.Identity) error {
+	_, info, err := fsid.FromOpen(f)
+	if err == nil {
+		err = fsid.Check(info, want)
+	}
+	if err != nil {
+		return err
+	}
+	current, _, err := openHashFile(path)
+	if err != nil {
+		return err
+	}
+	defer current.Close()
+	_, info, err = fsid.FromOpen(current)
+	if err != nil {
+		return err
+	}
+	return fsid.Check(info, want)
 }
 
 type hashedGroup struct {
@@ -138,7 +209,12 @@ func (s *scanner) groupDuplicates(ctx context.Context, cands []fileInfo, hs hash
 
 	var result []hashedGroup
 	for _, sz := range sizes {
-		samples := regroup(bySize[sz], func(f fileInfo) (string, error) { return hs.sample(ctx, f.Path, f.ID.Size) })
+		samples := regroup(bySize[sz], func(f fileInfo) (string, error) {
+			if err := fsid.Revalidate(f.Path, f.ID); err != nil {
+				return "", err
+			}
+			return hs.sample(ctx, f.Path, f.ID.Size)
+		})
 		var need []fileInfo
 		for _, g := range samples {
 			if len(g) > 1 {

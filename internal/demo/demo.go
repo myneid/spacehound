@@ -1,4 +1,4 @@
-// Package demo builds a deterministic fixture tree under the OS temp
+// Package demo builds a deterministic fixture tree under /private/tmp
 // directory so SpaceHound's scanner and UI can be exercised without looking
 // at real user data.
 package demo
@@ -17,6 +17,9 @@ import (
 
 // Now is the fixed reference time used for demo ages.
 var Now = time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+// macOS's usual TMPDIR is below /private/var/folders, a protected scan root.
+const fixtureRoot = "/private/tmp"
 
 // Fixture is a generated demo environment. Everything lives under Dir.
 type Fixture struct {
@@ -55,9 +58,9 @@ var files = []file{
 	{"Documents/notes.txt", 2 * units.KiB, 17, 3},
 }
 
-// Build creates a new fixture under the OS temp directory.
+// Build creates a new fixture under /private/tmp, independently of TMPDIR.
 func Build() (*Fixture, error) {
-	dir, err := os.MkdirTemp("", "spacehound-demo-")
+	dir, err := os.MkdirTemp(fixtureRoot, "spacehound-demo-")
 	if err != nil {
 		return nil, err
 	}
@@ -112,8 +115,7 @@ func (f *Fixture) Remove() error {
 	if f == nil || f.Dir == "" {
 		return nil
 	}
-	tmp, _ := filepath.EvalSymlinks(os.TempDir())
-	if filepath.Dir(f.Dir) != filepath.Clean(tmp) || len(filepath.Base(f.Dir)) < len("spacehound-demo-") ||
+	if filepath.Dir(f.Dir) != fixtureRoot || len(filepath.Base(f.Dir)) < len("spacehound-demo-") ||
 		filepath.Base(f.Dir)[:len("spacehound-demo-")] != "spacehound-demo-" {
 		return fmt.Errorf("refusing to remove %s: not a demo fixture", f.Dir)
 	}

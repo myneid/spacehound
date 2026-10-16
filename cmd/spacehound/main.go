@@ -20,6 +20,7 @@ import (
 
 	"spacehound/internal/demo"
 	"spacehound/internal/diskspace"
+	"spacehound/internal/display"
 	"spacehound/internal/model"
 	"spacehound/internal/offload"
 	"spacehound/internal/oplog"
@@ -39,10 +40,10 @@ const usageText = `SpaceHound — find space to reclaim on macOS, safely.
 Usage:
   spacehound [flags]
 
-Scanning is read-only. In the interactive UI, removal always means moving to
-the Trash (never a permanent delete) and offloading means verified copy to an
-external drive before the original is removed; both require a typed
-confirmation. --json output never changes anything.
+Scanning is read-only. Cleanup moves files to the Trash. Offloading copies
+and verifies a complete file on an external drive; a separate confirmation
+offers permanent removal of the original, moving it to Trash, or keeping
+both. Every action requires typed confirmation. --json never changes files.
 
 Flags:
   --root PATH            directory to scan (default: your home directory)
@@ -122,7 +123,9 @@ func parseArgs(args []string, stderr io.Writer) (*config, error) {
 	d := scan.DefaultOptions()
 	c := &config{Large: d.LargeThreshold, DupThreshold: d.DupThreshold, StaleDays: d.StaleDays, set: map[string]bool{}}
 	fs := flag.NewFlagSet("spacehound", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	// The caller prints the returned error through the terminal sanitizer.
+	// flag's own diagnostics can contain untrusted argument text.
+	fs.SetOutput(io.Discard)
 	fs.Usage = func() { fmt.Fprint(stderr, usageText) }
 	fs.StringVar(&c.Root, "root", "", "")
 	fs.Var(sizeFlag{&c.Large}, "large", "")
@@ -196,7 +199,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if err != nil {
-		fmt.Fprintln(stderr, "spacehound:", err)
+		fmt.Fprintln(stderr, "spacehound:", display.Text(err.Error()))
 		return 2
 	}
 	switch {
@@ -204,7 +207,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, usageText)
 		return 0
 	case c.Version:
-		fmt.Fprintln(stdout, "spacehound", version)
+		fmt.Fprintln(stdout, "spacehound", display.Text(version))
 		return 0
 	case c.ShowDefaults:
 		fmt.Fprintln(stdout, "Directories SpaceHound does not scan by default:")
@@ -221,7 +224,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	var fx *demo.Fixture
 	if c.Demo {
 		if fx, err = demo.Build(); err != nil {
-			fmt.Fprintln(stderr, "spacehound: building demo fixture:", err)
+			fmt.Fprintln(stderr, "spacehound: building demo fixture:", display.Text(err.Error()))
 			return 1
 		}
 		defer fx.Remove()
@@ -230,7 +233,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	rep, err := runScan(opts, stderr)
 	if err != nil {
-		fmt.Fprintln(stderr, "spacehound:", err)
+		fmt.Fprintln(stderr, "spacehound:", display.Text(err.Error()))
 		return 1
 	}
 	rep.Version = version
@@ -247,19 +250,32 @@ func run(args []string, stdout, stderr io.Writer) int {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(rep); err != nil {
-			fmt.Fprintln(stderr, "spacehound:", err)
+			fmt.Fprintln(stderr, "spacehound:", display.Text(err.Error()))
 			return 1
 		}
 		return 0
 	}
 
-	m := tui.New(rep, newEnv(rep.Home, fx))
+	env := newEnv(rep.Home, fx)
+	pending, pendingErr := env.Log.Pending()
+	if pendingErr != nil {
+		fmt.Fprintln(stderr, "spacehound: operation journal requires inspection:", display.Text(pendingErr.Error()))
+		return 1
+	}
+	for _, entry := range pending {
+		rep.Notes = append(rep.Notes, fmt.Sprintf("Unfinished %s for %s; inspect recovery location %s and destination %s (a path may no longer exist if the action completed before the journal was updated)", entry.Action, entry.Path, entry.RecoveryPath, entry.Dest))
+		fmt.Fprintln(stderr, display.Text(rep.Notes[len(rep.Notes)-1]))
+	}
+	m := tui.New(rep, env)
+	if len(pending) > 0 {
+		m.Update(tui.RecoveryMsg{Entries: pending})
+	}
 	m.Color = !c.NoColor && os.Getenv("NO_COLOR") == ""
 	if fx != nil {
 		m.Title = "DEMO"
 	}
 	if err := tui.Run(m); err != nil {
-		fmt.Fprintln(stderr, "spacehound:", err)
+		fmt.Fprintln(stderr, "spacehound:", display.Text(err.Error()))
 		return 1
 	}
 	return 0
@@ -286,7 +302,7 @@ func runScan(opts scan.Options, stderr io.Writer) (*model.Report, error) {
 				case <-t.C:
 					phase, cur := prog.Snapshot()
 					fmt.Fprintf(stderr, "\r\x1b[KScanning (%s) %d files, %s · %s  [Ctrl-C to stop]",
-						phase, prog.Files.Load(), units.FormatSize(prog.Bytes.Load()), shorten(cur, 50))
+						display.Text(phase), prog.Files.Load(), units.FormatSize(prog.Bytes.Load()), shorten(cur, 50))
 				}
 			}
 		}()
@@ -300,6 +316,10 @@ func runScan(opts scan.Options, stderr io.Writer) (*model.Report, error) {
 }
 
 func shorten(s string, n int) string {
+	s = display.Text(s)
+	if n <= 0 {
+		return ""
+	}
 	r := []rune(s)
 	if len(r) <= n {
 		return s
@@ -312,27 +332,16 @@ func shorten(s string, n int) string {
 // directory, so --demo never touches real files.
 func newEnv(home string, fx *demo.Fixture) tui.Env {
 	if fx != nil {
-		tr := &trash.Trasher{Home: fx.Home, DirFor: func(string, uint64) (string, error) { return fx.TrashDir, nil }}
+		journal := oplog.New(fx.LogDir)
+		tr := &trash.Trasher{Home: fx.Home, Journal: journal, DirFor: func(string, uint64) (string, error) { return fx.TrashDir, nil }}
 		off := offload.New(fx.Home)
-		off.Host = "demo-mac"
-		off.Statfs = fx.Statfs
-		off.AllowSameDevice = true
-		return tui.Env{
-			Trash:     tr.Trash,
-			Volumes:   fx.Lister().List,
-			Offloader: off,
-			FreeSpace: func() (diskspace.Info, error) { return diskspace.Statfs(fx.Dir) },
-			Log:       oplog.New(fx.LogDir),
-			Now:       time.Now,
-		}
+		off.Host, off.Statfs, off.AllowSameDevice, off.Journal = "demo-mac", fx.Statfs, true, journal
+		return tui.Env{Trash: tr.Trash, Volumes: fx.Lister().List, Offloader: off, FreeSpace: func() (diskspace.Info, error) { return diskspace.Statfs(fx.Dir) }, Log: journal, Now: time.Now}
 	}
+	journal := oplog.New(oplog.DefaultDir(home))
 	tr := trash.New(home)
-	return tui.Env{
-		Trash:     tr.Trash,
-		Volumes:   volumes.NewLister(home).List,
-		Offloader: offload.New(home),
-		FreeSpace: func() (diskspace.Info, error) { return diskspace.Statfs(home) },
-		Log:       oplog.New(oplog.DefaultDir(home)),
-		Now:       time.Now,
-	}
+	tr.Journal = journal
+	off := offload.New(home)
+	off.Journal = journal
+	return tui.Env{Trash: tr.Trash, Volumes: volumes.NewLister(home).List, Offloader: off, FreeSpace: func() (diskspace.Info, error) { return diskspace.Statfs(home) }, Log: journal, Now: time.Now}
 }

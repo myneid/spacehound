@@ -4,16 +4,21 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
 	"spacehound/internal/fsid"
+	"spacehound/internal/macosfs"
+	"spacehound/internal/oplog"
 )
 
 var stamp = time.Date(2026, 3, 4, 5, 6, 7, 0, time.Local)
 
 func setup(t *testing.T) (src, trashDir string, tr *Trasher) {
+	t.Setenv("TMPDIR", "/private/tmp")
 	root := t.TempDir()
+	root, _ = filepath.EvalSymlinks(root)
 	trashDir = filepath.Join(root, "Trash")
 	os.Mkdir(trashDir, 0o700)
 	src = filepath.Join(root, "work", "report.pdf")
@@ -21,7 +26,7 @@ func setup(t *testing.T) (src, trashDir string, tr *Trasher) {
 	if err := os.WriteFile(src, []byte("original"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tr = &Trasher{
+	tr = &Trasher{Journal: oplog.New(filepath.Join(root, "logs")),
 		DirFor: func(string, uint64) (string, error) { return trashDir, nil },
 		Now:    func() time.Time { return stamp },
 	}
@@ -113,5 +118,81 @@ func TestTrashRejectsRelativePath(t *testing.T) {
 	_, _, tr := setup(t)
 	if _, err := tr.Trash("relative/file", fsid.Identity{}); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestTrashNeverRestoresAReplacement(t *testing.T) {
+	src, dir, tr := setup(t)
+	id, _, _ := fsid.Of(src)
+	tr.move = func(from *os.File, name string, to *os.File, dest string) error {
+		if err := macosfs.Rename(from, name, to, dest); err != nil {
+			return err
+		}
+		if err := macosfs.Rename(to, dest, to, "preserved-original"); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dir, dest), []byte("replacement"), 0o600)
+	}
+	res, err := tr.Trash(src, id)
+	if err == nil || res.RecoveryPath != filepath.Join(dir, "preserved-original") {
+		t.Fatalf("lost original recovery location: %+v %v", res, err)
+	}
+	for path, want := range map[string]string{res.RecoveryPath: "original", filepath.Join(dir, "report.pdf"): "replacement"} {
+		got, readErr := os.ReadFile(path)
+		if readErr != nil || string(got) != want {
+			t.Fatalf("file moved or lost: %s = %q %v", path, got, readErr)
+		}
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatal("restored unrelated replacement", err)
+	}
+	pending, err := tr.Journal.Pending()
+	if err != nil || len(pending) != 1 || pending[0].RecoveryPath != res.RecoveryPath {
+		t.Fatal("original missing from journal", pending, err)
+	}
+}
+
+func TestTrashReportsRecoveryAfterDirectorySwap(t *testing.T) {
+	src, dir, tr := setup(t)
+	id, _, _ := fsid.Of(src)
+	elsewhere := t.TempDir()
+	calls := 0
+	tr.move = func(from *os.File, name string, to *os.File, dest string) error {
+		if err := macosfs.Rename(from, name, to, dest); err != nil {
+			return err
+		}
+		calls++
+		if calls == 1 {
+			if err := os.Rename(dir, dir+"-moved"); err != nil {
+				return err
+			}
+			return os.Symlink(elsewhere, dir)
+		}
+		return nil
+	}
+	res, err := tr.Trash(src, id)
+	if err == nil || res.RecoveryPath != filepath.Join(dir+"-moved", "report.pdf") {
+		t.Fatal("missing actual original location", res, err)
+	}
+	if got, err := os.ReadFile(res.RecoveryPath); err != nil || string(got) != "original" {
+		t.Fatal("original not preserved", string(got), err)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatal("unexpected name-based rollback", err)
+	}
+	if entries, err := os.ReadDir(elsewhere); err != nil || len(entries) != 0 {
+		t.Fatal("wrote through symlink", entries, err)
+	}
+}
+
+func TestUnsupportedExclusiveMoveNeverFallsBack(t *testing.T) {
+	src, _, tr := setup(t)
+	id, _, _ := fsid.Of(src)
+	tr.move = func(*os.File, string, *os.File, string) error { return syscall.ENOTSUP }
+	if _, err := tr.Trash(src, id); !errors.Is(err, syscall.ENOTSUP) {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(src); err != nil || string(got) != "original" {
+		t.Fatal("source lost after unsupported move", string(got), err)
 	}
 }

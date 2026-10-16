@@ -50,13 +50,25 @@ func testOptions(root string) Options {
 	}
 }
 
+func scanTempDir(t *testing.T) string {
+	t.Helper()
+	// Mandatory exclusions include macOS's per-user /private/var/folders
+	// tree. Generate fixtures outside it so tests exercise real policy.
+	dir, err := os.MkdirTemp("/private/tmp", "spacehound-scan-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
 type fixture struct {
 	root string
 	p    map[string]string
 }
 
 func buildFixture(t *testing.T) fixture {
-	root := t.TempDir()
+	root := scanTempDir(t)
 	// macOS temp dirs live behind the /var -> /private/var symlink.
 	root, _ = filepath.EvalSymlinks(root)
 	old := now.AddDate(0, 0, -200)
@@ -233,7 +245,7 @@ func TestScanCancelled(t *testing.T) {
 }
 
 func TestDuplicateHashingStages(t *testing.T) {
-	root := t.TempDir()
+	root := scanTempDir(t)
 	old := now.AddDate(-1, 0, 0)
 	o := testOptions(root)
 	o.Normalize()
@@ -255,6 +267,8 @@ func TestDuplicateHashingStages(t *testing.T) {
 	fi, _ := os.Lstat(alias)
 	aid, _ := fsidOf(fi)
 	cAlias := fileInfo{Path: alias, ModTime: fi.ModTime(), ID: aid}
+	// Creating the hard link changes ctime and link count on both aliases.
+	c.ID = aid
 
 	var samples, fulls atomic.Int32
 	hs := hashers{
@@ -330,7 +344,7 @@ func TestSensitivity(t *testing.T) {
 }
 
 func TestSparseAnnotation(t *testing.T) {
-	root := t.TempDir()
+	root := scanTempDir(t)
 	root, _ = filepath.EvalSymlinks(root)
 	p := filepath.Join(root, "sparse.img.bin")
 	fh, err := os.Create(p)

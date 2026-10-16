@@ -7,11 +7,12 @@ import (
 )
 
 // SkipRule describes a directory SpaceHound does not descend into by default.
-// Exactly one of HomeRel, Abs, Base or Suffix is set.
+// Exactly one of HomeRel, Abs, Base, Prefix or Suffix is set.
 type SkipRule struct {
 	HomeRel string // path relative to the home directory
 	Abs     string // absolute path
 	Base    string // directory name matched anywhere
+	Prefix  string // path-name prefix matched anywhere
 	Suffix  string // directory name suffix matched anywhere (package bundles)
 	Reason  string
 	// Overridable rules can be lifted with --include PATH; the others protect
@@ -22,6 +23,10 @@ type SkipRule struct {
 // DefaultSkipRules are the built-in exclusions. They are documented in
 // README.md and printed by `spacehound --show-defaults`.
 var DefaultSkipRules = []SkipRule{
+	// Failed/interrupted operations retain these originals or working copies.
+	{Prefix: ".spacehound-hold-", Reason: "SpaceHound recovery data (restore manually using the operation log)"},
+	{Prefix: ".spacehound-probe-", Reason: "SpaceHound filesystem safety probe"},
+	{Prefix: ".spacehound-partial-", Reason: "SpaceHound unfinished archive copy (review the operation log)"},
 	// Trash: already-deleted items; empty it from Finder.
 	{Base: ".Trash", Reason: "Trash (empty it from Finder instead)"},
 	{Base: ".Trashes", Reason: "volume Trash"},
@@ -69,6 +74,8 @@ func (r SkipRule) String() string {
 		what = r.Abs
 	case r.Base != "":
 		what = "any directory named " + r.Base
+	case r.Prefix != "":
+		what = "any path name beginning with " + r.Prefix
 	default:
 		what = "any directory ending in " + r.Suffix
 	}
@@ -82,15 +89,33 @@ func (r SkipRule) String() string {
 func (r SkipRule) matches(path, base, home string) bool {
 	switch {
 	case r.HomeRel != "":
-		return path == filepath.Join(home, r.HomeRel)
+		return strings.EqualFold(path, filepath.Join(home, r.HomeRel))
 	case r.Abs != "":
-		return path == r.Abs
+		return strings.EqualFold(path, r.Abs)
 	case r.Base != "":
-		return base == r.Base
+		return strings.EqualFold(base, r.Base)
+	case r.Prefix != "":
+		return strings.HasPrefix(strings.ToLower(base), strings.ToLower(r.Prefix))
 	case r.Suffix != "":
 		return strings.HasSuffix(strings.ToLower(base), r.Suffix)
 	}
 	return false
+}
+
+// ProtectedReason reports mandatory exclusions for path or any ancestor.
+// It also protects direct roots inside excluded directories, regardless of
+// --include or filesystem case sensitivity. Destructive operations share it.
+func ProtectedReason(path, home string) string {
+	for cur := filepath.Clean(path); ; cur = filepath.Dir(cur) {
+		for _, r := range DefaultSkipRules {
+			if !r.Overridable && r.matches(cur, filepath.Base(cur), home) {
+				return r.Reason
+			}
+		}
+		if parent := filepath.Dir(cur); parent == cur {
+			return ""
+		}
+	}
 }
 
 // within reports whether path equals dir or is inside it.
@@ -103,6 +128,9 @@ func within(path, dir string) bool {
 
 // skipReason returns why dir should not be scanned, or "".
 func (o *Options) skipReason(path string, isDir bool) string {
+	if reason := ProtectedReason(path, o.Home); reason != "" {
+		return reason
+	}
 	base := filepath.Base(path)
 	for _, ex := range o.Excludes {
 		if strings.HasPrefix(ex, "/") {
@@ -242,13 +270,26 @@ func sensitivity(path, rel string) string {
 			}
 		}
 	}
-	if p, ok := hasPrefixFold(rel, devRuntimeRoots...); ok {
-		return "developer runtime or toolchain (~/" + p + "); use the tool's own cleanup command"
+	if p, ok := pathRoot(path, devRuntimeRoots); ok {
+		return "developer runtime or toolchain (" + p + "); use the tool's own cleanup command"
 	}
-	if p, ok := hasPrefixFold(rel, appDataRoots...); ok {
-		return "application data (~/" + p + "); apps may need this file"
+	if p, ok := pathRoot(path, appDataRoots); ok {
+		return "application data (" + p + "); apps may need this file"
 	}
 	return ""
+}
+
+// pathRoot matches complete component sequences anywhere in an absolute
+// path. Application data and runtimes remain sensitive outside our home,
+// including other users' homes, system Library and mounted archives.
+func pathRoot(path string, roots []string) (string, bool) {
+	lower := "/" + strings.Trim(strings.ToLower(filepath.ToSlash(filepath.Clean(path))), "/") + "/"
+	for _, root := range roots {
+		if strings.Contains(lower, "/"+strings.ToLower(root)+"/") {
+			return root, true
+		}
+	}
+	return "", false
 }
 
 // isLevelDBLog matches LevelDB write-ahead logs such as "000123.log".

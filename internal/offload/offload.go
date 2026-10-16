@@ -1,84 +1,70 @@
-// Package offload copies a regular file to an external volume, verifies the
-// copy byte-for-byte, and only then lets the caller remove the original.
-//
-// The sequence is deliberately conservative:
-//
-//  1. re-check the source against its scan identity;
-//  2. re-check destination suitability and free space (with headroom);
-//  3. build the destination path without following symlinks and refuse to
-//     overwrite anything;
-//  4. copy to a hidden partial name in the destination folder (ditto by
-//     default, preserving macOS metadata);
-//  5. verify regular-file type, byte count and SHA-256 against the source,
-//     then confirm the source still matches its scan identity;
-//  6. publish the partial under its final name without overwriting.
-//
-// Copy never removes the source. RemoveSource does, and callers must only
-// invoke it after a separate explicit user confirmation.
+// Package offload copies and verifies complete files before separately
+// confirmed removal. All file access is anchored to directory descriptors.
 package offload
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"spacehound/internal/diskspace"
+	"spacehound/internal/fileops"
 	"spacehound/internal/fsid"
+	"spacehound/internal/macosfs"
+	"spacehound/internal/oplog"
+	"spacehound/internal/scan"
 	"spacehound/internal/volumes"
 )
 
-// ArchiveDir is the top-level folder created on the destination volume.
 const ArchiveDir = "SpaceHound Archive"
 
-// Ditto is the macOS copy tool that preserves resource forks, extended
-// attributes, ACLs and timestamps.
-const Ditto = "/usr/bin/ditto"
-
 var (
-	// ErrDestExists means the destination already exists; nothing is overwritten.
 	ErrDestExists = errors.New("destination already exists")
-	// ErrVerify means the copy does not match the source.
-	ErrVerify = errors.New("copy verification failed")
+	ErrVerify     = errors.New("copy verification failed")
 )
 
-// CopyFunc copies the regular file src to the new path dst. dst must not
-// exist; implementations must not overwrite it.
-type CopyFunc func(ctx context.Context, src, dst string) error
-
-// ProgressFunc receives coarse progress: phase is "copying" or "verifying".
+// CopyFunc receives already-open files; it cannot redirect their paths.
+type CopyFunc func(context.Context, *os.File, *os.File, func(int64)) error
 type ProgressFunc func(phase string, done, total int64)
 
-// Offloader performs offloads. Fields are injectable for tests and demo mode.
 type Offloader struct {
-	Home   string
-	Host   string
-	Now    func() time.Time
-	Copy   CopyFunc
-	Statfs func(string) (diskspace.Info, error)
-	// AllowSameDevice permits a destination on the source's own filesystem.
-	// Only tests and --demo set it; on a real system it would free nothing.
-	AllowSameDevice bool
-	// PollInterval controls how often copy progress is sampled.
-	PollInterval time.Duration
+	Home, Host      string
+	Now             func() time.Time
+	Copy            CopyFunc
+	Journal         *oplog.Logger
+	Statfs          func(string) (diskspace.Info, error)
+	AllowSameDevice bool // Generated fixtures only.
 }
 
-// New returns an Offloader using ditto when available.
 func New(home string) *Offloader {
-	o := &Offloader{Home: home, Host: Hostname(), Statfs: diskspace.Statfs, Copy: GoCopy}
-	if fi, err := os.Stat(Ditto); err == nil && fi.Mode()&0o111 != 0 {
-		o.Copy = DittoCopy
-	}
-	return o
+	return &Offloader{Home: home, Host: Hostname(), Copy: CopyFile, Statfs: diskspace.Statfs}
+}
+
+type Request struct {
+	Source   string
+	Identity fsid.Identity
+	Volume   volumes.Volume
+}
+
+type Result struct {
+	Source         string              `json:"source"`
+	Dest           string              `json:"dest"`
+	Partial        string              `json:"partial,omitempty"`
+	RecoveryPath   string              `json:"recovery_path,omitempty"`
+	Size           int64               `json:"size"`
+	SHA256         string              `json:"sha256,omitempty"`
+	Verified       bool                `json:"verified"`
+	SourceIdentity fsid.Identity       `json:"-"`
+	DestIdentity   fsid.Identity       `json:"-"`
+	Fingerprint    macosfs.Fingerprint `json:"-"`
+	VolumePath     string              `json:"-"`
+	VolumeIdentity fsid.Identity       `json:"-"`
+	Journal        *oplog.Logger       `json:"-"`
 }
 
 // Hostname returns a short, filesystem-safe host name.
@@ -101,26 +87,6 @@ func SanitizeName(s string) string {
 		return "Mac"
 	}
 	return s
-}
-
-// Request describes one file to offload.
-type Request struct {
-	Source   string
-	Identity fsid.Identity
-	Volume   volumes.Volume
-}
-
-// Result describes an offload attempt. Verified is true only when the
-// destination was proven identical and published under Dest.
-type Result struct {
-	Source         string        `json:"source"`
-	Dest           string        `json:"dest"`
-	Partial        string        `json:"partial,omitempty"`
-	Size           int64         `json:"size"`
-	SHA256         string        `json:"sha256,omitempty"`
-	Verified       bool          `json:"verified"`
-	SourceIdentity fsid.Identity `json:"-"`
-	DestIdentity   fsid.Identity `json:"-"`
 }
 
 func within(path, dir string) bool {
@@ -157,85 +123,56 @@ func DestPath(vol, host string, date time.Time, home, src string) (string, error
 	return dest, nil
 }
 
-// mkdirNoFollow creates every directory from root down to dir, refusing to
-// traverse symlinks or non-directories. root itself must already exist.
-func mkdirNoFollow(root, dir string) error {
-	fi, err := os.Lstat(root)
-	if err != nil {
-		return err
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf("%s is not a directory (symlinks are not followed)", root)
-	}
-	if !within(dir, root) {
-		return fmt.Errorf("%s is outside %s", dir, root)
-	}
-	rel, _ := filepath.Rel(root, dir)
-	cur := root
-	for _, c := range strings.Split(rel, string(filepath.Separator)) {
-		if c == "." || c == "" {
-			continue
-		}
-		cur = filepath.Join(cur, c)
-		fi, err := os.Lstat(cur)
-		if errors.Is(err, fs.ErrNotExist) {
-			if err := os.Mkdir(cur, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
-				return err
-			}
-			fi, err = os.Lstat(cur)
-		}
-		if err != nil {
-			return err
-		}
-		if fi.Mode()&fs.ModeSymlink != 0 {
-			return fmt.Errorf("refusing to follow symlink %s on destination", cur)
-		}
-		if !fi.IsDir() {
-			return fmt.Errorf("%s exists and is not a directory", cur)
-		}
-	}
-	return nil
-}
-
 func (o *Offloader) now() time.Time {
 	if o.Now != nil {
 		return o.Now()
 	}
 	return time.Now()
 }
-
-// Plan returns the destination path for req without touching anything.
 func (o *Offloader) Plan(req Request) (string, error) {
 	return DestPath(req.Volume.Path, o.Host, o.now(), o.Home, req.Source)
 }
 
-// Offload copies and verifies req. It never removes or alters the source.
-// On failure after copying began, Result.Partial names the leftover copy.
-func (o *Offloader) Offload(ctx context.Context, req Request, progress ProgressFunc) (Result, error) {
-	res := Result{Source: req.Source, Size: req.Identity.Size, SourceIdentity: req.Identity}
+func (o *Offloader) Offload(ctx context.Context, req Request, progress ProgressFunc) (res Result, retErr error) {
+	res = Result{Source: req.Source, Size: req.Identity.Size, SourceIdentity: req.Identity, Journal: o.Journal, VolumePath: req.Volume.Path}
 	if progress == nil {
 		progress = func(string, int64, int64) {}
 	}
-	if err := fsid.Revalidate(req.Source, req.Identity); err != nil {
+	if why := scan.ProtectedReason(req.Source, o.Home); why != "" {
+		return res, fmt.Errorf("protected source: %s", why)
+	}
+	if err := o.Journal.Check(); err != nil {
 		return res, err
 	}
-	if req.Identity.Nlink > 1 {
-		return res, fmt.Errorf("%s has %d hard links; offloading one name frees no space", req.Source, req.Identity.Nlink)
+	source, err := fileops.OpenRegular(req.Source, &req.Identity)
+	if err != nil {
+		return res, err
+	}
+	defer source.Close()
+	if req.Identity.Nlink != 1 {
+		return res, errors.New("offloading requires a file with exactly one hard link")
 	}
 	vol := req.Volume
-	if !o.AllowSameDevice && vol.Dev == req.Identity.Dev {
-		return res, fmt.Errorf("%s is on the same disk as the source; offloading would free nothing", vol.Path)
+	root, err := macosfs.OpenDir(vol.Path, false, 0)
+	if err != nil {
+		return res, err
+	}
+	defer root.Close()
+	vid, _, err := fsid.FromOpen(root)
+	if err != nil {
+		return res, err
+	}
+	res.VolumeIdentity = vid
+	if !o.AllowSameDevice && (vid.Dev != vol.Dev || vid.Dev == req.Identity.Dev) {
+		return res, errors.New("destination volume changed or is on the source filesystem")
 	}
 	if o.Statfs != nil {
 		info, err := o.Statfs(vol.Path)
 		if err != nil {
 			return res, fmt.Errorf("destination unavailable: %w", err)
 		}
-		if !o.AllowSameDevice && info.MountPoint != vol.Path {
-			return res, fmt.Errorf("%s is no longer mounted", vol.Path)
-		}
-		if info.ReadOnly() {
-			return res, fmt.Errorf("%s is now read-only", vol.Path)
+		if info.ReadOnly() || (!o.AllowSameDevice && info.MountPoint != vol.Path) {
+			return res, errors.New("destination is read-only or no longer mounted")
 		}
 		vol.Free, vol.Total = info.Free, info.Total
 	}
@@ -247,248 +184,295 @@ func (o *Offloader) Offload(ctx context.Context, req Request, progress ProgressF
 		return res, err
 	}
 	res.Dest = dest
-	if _, err := os.Lstat(dest); err == nil {
-		return res, fmt.Errorf("%w: %s (nothing was overwritten)", ErrDestExists, dest)
-	} else if !errors.Is(err, fs.ErrNotExist) {
+	dirPath := filepath.Dir(dest)
+	dir, err := macosfs.OpenDir(dirPath, true, 0o755)
+	if err != nil {
 		return res, err
 	}
-	dir := filepath.Dir(dest)
-	if err := mkdirNoFollow(vol.Path, dir); err != nil {
+	defer dir.Close()
+	// Opening from / is no-follow; also reject a changed volume root.
+	if err := fileops.CheckDir(root, vol.Path); err != nil {
 		return res, err
 	}
-	partial := filepath.Join(dir, fmt.Sprintf(".%s.spacehound-partial-%d", filepath.Base(dest), o.now().UnixNano()))
-	if _, err := os.Lstat(partial); err == nil {
-		return res, fmt.Errorf("%w: %s", ErrDestExists, partial)
+	if exists, err := macosfs.ExistsAt(dir, filepath.Base(dest)); err != nil {
+		return res, err
+	} else if exists {
+		return res, ErrDestExists
 	}
-
-	// Copy.
-	if err := o.copyWithProgress(ctx, req.Source, partial, req.Identity.Size, progress); err != nil {
-		return o.leftover(res, partial, fmt.Errorf("copy failed: %w", err))
-	}
-
-	// Verify the copy.
-	cur, fi, err := fsid.Of(partial)
+	// Capture a stable, complete source fingerprint before making any copy.
+	before, err := macosfs.FingerprintFile(ctx, source, nil)
 	if err != nil {
-		return o.leftover(res, partial, fmt.Errorf("%w: cannot stat copy: %v", ErrVerify, err))
+		return res, err
 	}
-	if !fi.Mode().IsRegular() {
-		return o.leftover(res, partial, fmt.Errorf("%w: copy is not a regular file (%s)", ErrVerify, fi.Mode().Type()))
+	if fi, err := source.Stat(); err != nil {
+		return res, err
+	} else if err := fsid.Check(fi, req.Identity); err != nil {
+		return res, err
 	}
-	if cur.Size != req.Identity.Size {
-		return o.leftover(res, partial, fmt.Errorf("%w: copy has %d bytes, source has %d", ErrVerify, cur.Size, req.Identity.Size))
+	partial := ".spacehound-partial-" + fileops.ID()
+	entry := oplog.Entry{ID: fileops.ID(), Action: "offload-copy", Phase: "intent", Path: req.Source, Dest: dest, Size: req.Identity.Size, RecoveryPath: filepath.Join(dirPath, partial)}
+	if info, err := diskspace.Statfs(filepath.Dir(req.Source)); err == nil {
+		entry.FreeBefore = info.Free
 	}
-	srcSum, err := hashFile(ctx, req.Source, &req.Identity, func(n int64) { progress("verifying", n, 2*req.Identity.Size) })
+	if err := o.Journal.Log(entry); err != nil {
+		return res, err
+	}
+	defer func() {
+		entry.Phase, entry.OK = "complete", retErr == nil
+		if info, err := diskspace.Statfs(filepath.Dir(req.Source)); err == nil {
+			entry.FreeAfter = info.Free
+		}
+		entry.RecoveryPath = ""
+		if retErr != nil {
+			entry.Error = retErr.Error()
+			if res.Partial != "" {
+				entry.Phase, entry.RecoveryPath = "recovery", res.Partial
+			}
+		}
+		if err := o.Journal.Log(entry); err != nil {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
+	out, err := macosfs.OpenAt(dir, partial, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return o.leftover(res, partial, fmt.Errorf("%w: hashing source: %v", ErrVerify, err))
+		return res, err
 	}
-	dstSum, err := hashFile(ctx, partial, nil, func(n int64) { progress("verifying", req.Identity.Size+n, 2*req.Identity.Size) })
+	defer out.Close()
+	partialPath := func() string {
+		p, err := macosfs.Path(dir)
+		if err != nil {
+			p = dirPath
+		}
+		return filepath.Join(p, partial)
+	}
+	failed := func(err error) (Result, error) {
+		res.Partial = partialPath()
+		return res, fmt.Errorf("%w; original retained; copy preserved at %s", err, res.Partial)
+	}
+	if o.Copy == nil {
+		return failed(errors.New("no metadata-preserving copy method configured"))
+	}
+	progress("copying", 0, req.Identity.Size)
+	if err := o.Copy(ctx, source, out, func(n int64) { progress("copying", n, req.Identity.Size) }); err != nil {
+		return failed(err)
+	}
+	after, err := macosfs.FingerprintFile(ctx, source, func(n int64) { progress("verifying", n, 2*req.Identity.Size) })
 	if err != nil {
-		return o.leftover(res, partial, fmt.Errorf("%w: hashing copy: %v", ErrVerify, err))
+		return failed(err)
 	}
-	if srcSum != dstSum {
-		return o.leftover(res, partial, fmt.Errorf("%w: SHA-256 mismatch (source %s, copy %s)", ErrVerify, srcSum, dstSum))
+	copied, err := macosfs.FingerprintFile(ctx, out, func(n int64) { progress("verifying", req.Identity.Size+n, 2*req.Identity.Size) })
+	if err != nil {
+		return failed(err)
 	}
-	if err := fsid.Revalidate(req.Source, req.Identity); err != nil {
-		return o.leftover(res, partial, fmt.Errorf("source changed during offload: %w", err))
+	if before != after {
+		return failed(fmt.Errorf("%w: source data or metadata changed during copying", ErrVerify))
 	}
-	res.SHA256 = srcSum
-
-	// Publish without overwriting.
-	if err := publish(partial, dest); err != nil {
-		return o.leftover(res, partial, err)
+	if after != copied {
+		return failed(fmt.Errorf("%w: destination data or metadata differs (source %s/%s, copy %s/%s)", ErrVerify, after.SHA256, after.MetadataSHA256, copied.SHA256, copied.MetadataSHA256))
 	}
-	did, dfi, err := fsid.Of(dest)
-	if err != nil || !dfi.Mode().IsRegular() || did.Size != req.Identity.Size {
-		return o.leftover(res, "", fmt.Errorf("%w: published copy could not be re-checked: %v", ErrVerify, err))
+	entry.SHA256 = copied.SHA256
+	if fi, err := source.Stat(); err != nil {
+		return failed(err)
+	} else if err := fsid.Check(fi, req.Identity); err != nil {
+		return failed(err)
 	}
-	res.DestIdentity = did
-	res.Verified = true
+	if err := fileops.CheckDir(dir, dirPath); err != nil {
+		return failed(err)
+	}
+	if err := macosfs.FullSync(out); err != nil {
+		return failed(fmt.Errorf("cannot flush destination: %w", err))
+	}
+	if err := macosfs.Rename(dir, partial, dir, filepath.Base(dest)); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			err = fmt.Errorf("%w: %s", ErrDestExists, dest)
+		}
+		return failed(err)
+	}
+	partial = filepath.Base(dest)
+	if err := dir.Sync(); err != nil {
+		return failed(err)
+	}
+	if err := macosfs.FullSync(out); err != nil {
+		return failed(fmt.Errorf("cannot flush published destination: %w", err))
+	}
+	if err := fileops.CheckDir(root, vol.Path); err != nil {
+		return failed(err)
+	}
+	if err := fileops.CheckDir(dir, dirPath); err != nil {
+		return failed(err)
+	}
+	did, _, err := fsid.FromOpen(out)
+	if err != nil {
+		return failed(err)
+	}
+	check, err := fileops.OpenRegular(dest, &did)
+	if err != nil {
+		return failed(err)
+	}
+	check.Close()
+	res.DestIdentity, res.Fingerprint, res.SHA256, res.Verified = did, copied, copied.SHA256, true
 	return res, nil
 }
 
-func (o *Offloader) leftover(res Result, partial string, err error) (Result, error) {
-	if partial != "" {
-		if _, lerr := os.Lstat(partial); lerr == nil {
-			res.Partial = partial
-			return res, fmt.Errorf("%w. The original was kept; a partial copy was left at %s for manual inspection", err, partial)
-		}
-	}
-	return res, fmt.Errorf("%w. The original was kept", err)
-}
-
-// publish gives partial its final name dest without ever replacing dest.
-func publish(partial, dest string) error {
-	err := os.Link(partial, dest)
-	switch {
-	case err == nil:
-		return os.Remove(partial) // drop the temporary second name
-	case errors.Is(err, fs.ErrExist):
-		return fmt.Errorf("%w: %s appeared during the copy (nothing was overwritten)", ErrDestExists, dest)
-	case errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EMLINK):
-		// FAT/exFAT have no hard links: check, then rename.
-		if _, lerr := os.Lstat(dest); lerr == nil {
-			return fmt.Errorf("%w: %s (nothing was overwritten)", ErrDestExists, dest)
-		}
-		return os.Rename(partial, dest)
-	default:
+// CopyFile copies data with cancellation, then all macOS file metadata.
+func CopyFile(ctx context.Context, src, dst *os.File, progress func(int64)) error {
+	if _, err := src.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-}
-
-func (o *Offloader) copyWithProgress(ctx context.Context, src, dst string, total int64, progress ProgressFunc) error {
-	if o.Copy == nil {
-		return errors.New("no copy method configured")
-	}
-	interval := o.PollInterval
-	if interval <= 0 {
-		interval = 250 * time.Millisecond
-	}
-	done := make(chan struct{})
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-t.C:
-				if fi, err := os.Lstat(dst); err == nil {
-					progress("copying", fi.Size(), total)
-				}
-			}
-		}
-	}()
-	progress("copying", 0, total)
-	err := o.Copy(ctx, src, dst)
-	close(done)
-	<-stopped
-	if err == nil {
-		progress("copying", total, total)
-	}
-	return err
-}
-
-// hashFile returns the SHA-256 of path, opened without following symlinks.
-// If want is set the open file must still match that identity.
-func hashFile(ctx context.Context, path string, want *fsid.Identity, step func(int64)) (string, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if want != nil {
-		fi, err := f.Stat()
-		if err != nil {
-			return "", err
-		}
-		id, ok := fsid.FromFileInfo(fi)
-		if !ok || !id.SameFile(*want) || id.Size != want.Size || id.MtimeNs != want.MtimeNs {
-			return "", fmt.Errorf("%w: %s", fsid.ErrChanged, path)
-		}
-	}
-	h := sha256.New()
-	buf := make([]byte, 1<<20)
-	var n int64
-	for {
-		if err := ctx.Err(); err != nil {
-			return "", err
-		}
-		k, rerr := f.Read(buf)
-		h.Write(buf[:k])
-		n += int64(k)
-		if step != nil && k > 0 {
-			step(n)
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return "", rerr
-		}
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// CheckRemovable re-confirms that a verified copy is still in place and the
-// source is unchanged. Call it immediately before removing the original.
-func CheckRemovable(res Result) error {
-	if !res.Verified {
-		return errors.New("copy was not verified; the original must be kept")
-	}
-	if err := fsid.Revalidate(res.Dest, res.DestIdentity); err != nil {
-		return fmt.Errorf("verified copy changed or disappeared, keeping the original: %w", err)
-	}
-	if err := fsid.Revalidate(res.Source, res.SourceIdentity); err != nil {
+	if _, err := dst.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	return nil
-}
-
-// RemoveSource deletes the original after CheckRemovable succeeds. Callers
-// must only use it after the user explicitly confirmed removal of a
-// verified offload; the data then lives on at res.Dest.
-func RemoveSource(res Result) error {
-	if err := CheckRemovable(res); err != nil {
+	if _, err := io.Copy(dst, &copyReader{ctx: ctx, r: src, step: progress}); err != nil {
 		return err
 	}
-	return os.Remove(res.Source)
-}
-
-// DittoCopy copies with /usr/bin/ditto, preserving macOS metadata.
-func DittoCopy(ctx context.Context, src, dst string) error {
-	if _, err := os.Lstat(dst); err == nil {
-		return fmt.Errorf("%w: %s", ErrDestExists, dst)
-	}
-	out, err := exec.CommandContext(ctx, Ditto, src, dst).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ditto: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-// GoCopy is a portable fallback that copies data, permissions and mtime.
-// It does not preserve extended attributes or resource forks.
-func GoCopy(ctx context.Context, src, dst string) error {
-	in, err := os.OpenFile(src, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	defer in.Close()
-	fi, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	if !fi.Mode().IsRegular() {
-		return fmt.Errorf("%s is not a regular file", src)
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return err
-	}
-	_, cerr := io.Copy(out, ctxReader{ctx, in})
-	if cerr == nil {
-		cerr = out.Sync()
-	}
-	if err := out.Close(); cerr == nil {
-		cerr = err
-	}
-	if cerr != nil {
-		return cerr
-	}
-	os.Chmod(dst, fi.Mode().Perm())
-	return os.Chtimes(dst, fi.ModTime(), fi.ModTime())
+	return macosfs.CopyMetadata(src, dst)
 }
 
-type ctxReader struct {
-	ctx context.Context
-	r   io.Reader
+type copyReader struct {
+	ctx  context.Context
+	r    io.Reader
+	step func(int64)
+	n    int64
 }
 
-func (c ctxReader) Read(p []byte) (int, error) {
-	if err := c.ctx.Err(); err != nil {
+func (r *copyReader) Read(b []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
 		return 0, err
 	}
-	return c.r.Read(p)
+	n, err := r.r.Read(b)
+	r.n += int64(n)
+	if r.step != nil {
+		r.step(r.n)
+	}
+	return n, err
+}
+
+func checkCopy(ctx context.Context, path string, want fsid.Identity, fingerprint macosfs.Fingerprint) (*os.File, error) {
+	f, err := fileops.OpenRegular(path, &want)
+	if err != nil {
+		return nil, err
+	}
+	got, err := macosfs.FingerprintFile(ctx, f, nil)
+	if err == nil {
+		fi, statErr := f.Stat()
+		err = statErr
+		if err == nil {
+			err = fsid.Check(fi, want)
+		}
+	}
+	if err == nil && got != fingerprint {
+		err = fmt.Errorf("%w: data or metadata changed: %s", ErrVerify, path)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+func CheckRemovable(res Result) error { return CheckRemovableContext(context.Background(), res) }
+func CheckRemovableContext(ctx context.Context, res Result) error {
+	if !res.Verified || res.Fingerprint.SHA256 == "" {
+		return errors.New("no complete verified copy; original must be retained")
+	}
+	root, err := macosfs.OpenDir(res.VolumePath, false, 0)
+	if err != nil {
+		return err
+	}
+	id, _, err := fsid.FromOpen(root)
+	root.Close()
+	if err != nil {
+		return err
+	}
+	if !id.SameFile(res.VolumeIdentity) {
+		return errors.New("destination volume changed; original retained")
+	}
+	for _, entry := range []struct {
+		path string
+		id   fsid.Identity
+	}{{res.Source, res.SourceIdentity}, {res.Dest, res.DestIdentity}} {
+		f, err := checkCopy(ctx, entry.path, entry.id, res.Fingerprint)
+		if err != nil {
+			return err
+		}
+		f.Close()
+	}
+	return nil
+}
+func RemoveSource(res Result) error { return RemoveSourceContext(context.Background(), res) }
+func RemoveSourceContext(ctx context.Context, res Result) error {
+	if err := res.Journal.Check(); err != nil {
+		return err
+	}
+	if err := CheckRemovableContext(ctx, res); err != nil {
+		return err
+	}
+	parent, err := macosfs.OpenDir(filepath.Dir(res.Source), false, 0)
+	if err != nil {
+		return err
+	}
+	err = macosfs.CheckGuardedUnlink(parent)
+	parent.Close()
+	if err != nil {
+		return fmt.Errorf("permanent removal unavailable; use Trash or keep both: %w", err)
+	}
+	capture, err := fileops.Take(res.Source, res.SourceIdentity, res.Journal, "offload-remove-source", res.Dest)
+	if err != nil {
+		return err
+	}
+	defer capture.Close()
+	fail := func(err error) error { return capture.Restore(err) }
+	capture.Entry.SHA256 = res.SHA256
+	originalID, _, err := fsid.FromOpen(capture.File)
+	if err != nil {
+		return fail(err)
+	}
+	current, err := macosfs.FingerprintFile(ctx, capture.File, nil)
+	if err != nil {
+		return fail(err)
+	}
+	if current != res.Fingerprint {
+		return fail(fmt.Errorf("%w: captured original changed", ErrVerify))
+	}
+	dest, err := checkCopy(ctx, res.Dest, res.DestIdentity, res.Fingerprint)
+	if err != nil {
+		return fail(err)
+	}
+	defer dest.Close()
+	err = macosfs.FullSync(dest)
+	if err != nil {
+		return fail(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	if fi, err := capture.File.Stat(); err != nil {
+		return fail(err)
+	} else if err := fsid.Check(fi, originalID); err != nil {
+		return fail(err)
+	}
+	if fi, err := dest.Stat(); err != nil {
+		return fail(err)
+	} else if err := fsid.Check(fi, res.DestIdentity); err != nil {
+		return fail(err)
+	}
+	if err := fileops.CheckDir(capture.Parent, filepath.Dir(res.Source)); err != nil {
+		return fail(err)
+	}
+	if err := fileops.CheckDir(capture.Dir, filepath.Dir(capture.RecoveryPath())); err != nil {
+		return fail(err)
+	}
+	if err := capture.File.Close(); err != nil {
+		return fail(err)
+	}
+	capture.File = nil
+	if err := macosfs.Unlink(capture.Dir, "original", true); err != nil {
+		return fail(err)
+	}
+	if err := capture.Done(); err != nil {
+		return fmt.Errorf("original removed; journal completion failed: %w", err)
+	}
+	return nil
 }

@@ -45,6 +45,9 @@ type KeyMsg struct{ Key term.Key }
 // ResizeMsg reports the terminal size.
 type ResizeMsg struct{ W, H int }
 
+// RecoveryMsg makes unfinished operations visible before accepting actions.
+type RecoveryMsg struct{ Entries []oplog.Entry }
+
 // Cmd is asynchronous work started by Update. It may call send to post
 // progress and returns its final message.
 type Cmd func(send func(Msg)) Msg
@@ -268,6 +271,12 @@ func totals(items []*model.Item) (size, likely int64) {
 // Update applies a message and returns follow-up work, if any.
 func (m *Model) Update(msg Msg) Cmd {
 	switch msg := msg.(type) {
+	case RecoveryMsg:
+		lines := []string{"These operations have no recorded completion. Inspect the paths before continuing; a recovery file may already have been restored or removed."}
+		for _, entry := range msg.Entries {
+			lines = append(lines, entry.Path, "  recovery: "+entry.RecoveryPath, "  destination: "+entry.Dest)
+		}
+		m.showResult("Unfinished operations", lines)
 	case ResizeMsg:
 		m.width, m.height = msg.W, msg.H
 		m.clamp()

@@ -1,8 +1,8 @@
 # SpaceHound
 
 A safe, friendly macOS terminal UI for finding disk space you can get back.
-It's a single native binary with no dependencies, and it supports Apple
-Silicon and Intel Macs.
+It's a single native binary using macOS system libraries, and it supports
+Apple Silicon and Intel Macs. No third-party Go modules are needed.
 
 SpaceHound looks for:
 
@@ -29,7 +29,7 @@ with a `.log` extension isn't treated as safe just because of its name.
 
 For large files you have two remedies:
 
-- **Move to Trash**: Finder-style. It is never a permanent delete.
+- **Move to Trash**: a same-volume move with a recorded restoration path.
 - **Offload to an external drive**: copy, verify, and only then remove the
   original (details below).
 
@@ -63,7 +63,8 @@ when you choose that directory and it isn't writable, and even then it uses
 
 ### From source
 
-Requires Go 1.22 or newer. No third-party modules are needed.
+Requires macOS, Go 1.22 or newer, and Apple's command-line compiler tools
+(`xcode-select --install`). Builds use cgo and macOS system libraries.
 
 ```sh
 make build          # produces ./spacehound
@@ -124,28 +125,47 @@ you get the partial results, clearly marked as partial.
    `<volume>/SpaceHound Archive/<hostname>/<YYYY-MM-DD>/<path relative to home>`.
    SpaceHound checks free space (with headroom) before it copies. It never
    overwrites an existing file.
-3. It copies with `/usr/bin/ditto`, which preserves macOS metadata. Then it
-   checks that the destination is a regular file and that its byte count
-   and SHA-256 match the source. It also re-checks that the source hasn't
-   changed since the scan.
+3. It copies through held file descriptors, preserves native metadata, and
+   verifies both the main contents and resource fork, extended attributes,
+   ACLs, permissions, ownership and supported timestamps/flags. A mismatch
+   keeps the original. Existing files and symlink ancestors are refused.
 4. Only after verification does it ask, as a separate step, whether to
    `remove` the originals, move them to the `trash`, or keep both.
 
-If anything fails, the original stays where it is and SpaceHound shows you
-any partial copy so you can inspect it.
+Before choosing `remove`, close applications that may write the selected
+files. Removal recalculates both fingerprints, captures the original in a
+private directory on its own filesystem, verifies it again, and requires a
+durable destination. A runtime probe must prove that the source filesystem
+rejects removal of busy or multiply linked files. Unsupported operations
+refuse removal; use Trash or keep both instead. A write that finishes
+between final verification and deletion can still escape detection.
+
+Failures retain the original or restore it without overwriting another
+file. If restoration is blocked, SpaceHound reports the preserved file's
+`recovery_path`. Partial copies are also reported for inspection.
 
 ### Operation log
 
 Every mutating operation is appended as JSON lines to
-`~/Library/Logs/SpaceHound/operations.log` (mode 0600). Each entry records
-paths, sizes, hashes, outcomes and free space. File contents are never
-logged.
+`~/Library/Logs/SpaceHound/operations.log` (mode 0600 in a private 0700
+directory, with extended ACL grants removed). The journal records operation
+intent before moving an original, then its outcome, paths, sizes and hashes.
+File contents are never logged. Unsafe ownership, symlinks, hard links or
+an unavailable journal block file-changing operations.
+
+Interactive startup reports unfinished journal entries and their recovery
+locations. Inspect those paths before moving anything manually; an entry
+can remain unfinished even if the action completed before a crash.
+SpaceHound never automatically deletes recovery files. Trash moves record
+the original and final paths; restore manually from that Trash location.
 
 ## Default skip rules
 
-SpaceHound never scans the Trash, Time Machine and backup structures,
+SpaceHound never scans the Trash, its own recovery files, Time Machine and backup structures,
 Spotlight and other filesystem metadata, or OS areas such as `/System`,
-`/usr` and `/private/var/db`. By default it also skips the following; you
+`/usr` and `/private/var/db`. Mandatory exclusions apply even when the chosen
+root is inside one of these directories, with any capitalization. By default
+it also skips the following; you
 can scan them with `--include`:
 
 - iCloud Drive and File Provider internals (`~/Library/Mobile Documents`,
@@ -171,7 +191,7 @@ physical savings.
 
 ## Demo and verification
 
-`--demo` builds a deterministic fixture tree in the OS temp directory: a fake
+`--demo` builds a deterministic fixture tree under `/private/tmp`: a fake
 home, a fake `/Volumes` with one usable drive and two unsuitable ones, a
 private Trash folder and a private log directory. All scanning, trashing and
 offloading in demo mode stays inside that tree, and the tree is deleted on
@@ -183,10 +203,10 @@ make demo        # interactive UI on the fixture
 ```
 
 Automated tests cover parsing, classification, duplicates, identity
-revalidation, Trash collisions, volume suitability, destination
-construction, copy verification, key decoding and CLI flag wiring, all on
-temporary fixtures. The interactive UI (`internal/tui`) has no automated
-tests yet. Check it by hand with `make demo`: browse, filter, trash an item,
+revalidation, metadata preservation, source/destination replacement,
+guarded removal, recovery journaling, Trash collisions, terminal control
+escaping and CLI/UI wiring, all on temporary fixtures. `make test` runs
+with the race detector. Check interactions by hand with `make demo`: browse, filter, trash an item,
 offload to "Demo Drive", and confirm that "Time Machine" and "Read Only" are
 rejected.
 

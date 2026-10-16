@@ -7,9 +7,10 @@ import (
 	"time"
 
 	"spacehound/internal/diskspace"
+	"spacehound/internal/display"
 	"spacehound/internal/model"
 	"spacehound/internal/offload"
-	"spacehound/internal/oplog"
+
 	"spacehound/internal/term"
 	"spacehound/internal/units"
 	"spacehound/internal/volumes"
@@ -108,21 +109,16 @@ func (m *Model) runTrash() Cmd {
 		out := trashDoneMsg{before: freeNow(env)}
 		for i, it := range targets {
 			if ctx.Err() != nil {
-				out.fails = append(out.fails, "Cancelled; left in place: "+it.Path)
+				out.fails = append(out.fails, "Cancelled; left in place: "+display.Text(it.Path))
 				continue
 			}
 			send(progressMsg(fmt.Sprintf("%d/%d  %s", i+1, len(targets), it.Path)))
 			res, err := env.Trash(it.Path, it.Identity)
-			e := oplog.Entry{Action: "trash", Path: it.Path, Dest: res.Dest, Size: it.Size, OK: err == nil}
 			if err != nil {
-				e.Error = err.Error()
-				out.fails = append(out.fails, fmt.Sprintf("NOT trashed: %s\n    %v", it.Path, err))
+				out.fails = append(out.fails, fmt.Sprintf("Trash operation result: %s\n    %s", display.Text(it.Path), display.Text(err.Error())))
 			} else {
 				out.done = append(out.done, it)
-				out.lines = append(out.lines, fmt.Sprintf("  %s\n    -> %s", it.Path, res.Method))
-			}
-			if lerr := env.Log.Log(e); lerr != nil {
-				out.fails = append(out.fails, "Operation log: "+lerr.Error())
+				out.lines = append(out.lines, fmt.Sprintf("  %s\n    -> %s", display.Text(it.Path), display.Text(res.Method)))
 			}
 		}
 		out.after = freeNow(env)
@@ -143,7 +139,7 @@ func (m *Model) trashDone(msg trashDoneMsg) Cmd {
 	lines := []string{fmt.Sprintf("Moved %s to the Trash (%s).", plural(len(msg.done), "item"), units.FormatSize(likely))}
 	lines = append(lines, splitAll(msg.lines)...)
 	if len(msg.fails) > 0 {
-		lines = append(lines, "", fmt.Sprintf("%s were left in place:", plural(len(msg.fails), "item")))
+		lines = append(lines, "", fmt.Sprintf("%s need inspection:", plural(len(msg.fails), "operation")))
 		lines = append(lines, splitAll(msg.fails)...)
 	}
 	lines = append(lines, "", freeLine(msg.before, msg.after))
@@ -151,7 +147,7 @@ func (m *Model) trashDone(msg trashDoneMsg) Cmd {
 		lines = append(lines,
 			"Items in the Trash still use disk space. Empty the Trash in Finder to reclaim",
 			fmt.Sprintf("about %s, then press f to re-check free space.", units.FormatSize(likely)),
-			"Until then you can restore them with Finder's \"Put Back\".")
+			"Restore manually from the Trash locations shown above.")
 	}
 	if m.Env.Log != nil {
 		lines = append(lines, "Logged to "+m.Env.Log.Path())
@@ -267,7 +263,7 @@ func (m *Model) runOffload() Cmd {
 		p := throttle(send)
 		for i, it := range targets {
 			if ctx.Err() != nil {
-				out.fails = append(out.fails, "Cancelled; not copied: "+it.Path)
+				out.fails = append(out.fails, "Cancelled; not copied: "+display.Text(it.Path))
 				continue
 			}
 			prefix := fmt.Sprintf("%d/%d  %s", i+1, len(targets), base(it.Path))
@@ -280,16 +276,11 @@ func (m *Model) runOffload() Cmd {
 					}
 					p(fmt.Sprintf("%s  %s %5.1f%%  %s", prefix, phase, pct, bar(pct, 30)))
 				})
-			e := oplog.Entry{Action: "offload-copy", Path: it.Path, Dest: res.Dest, Size: it.Size, SHA256: res.SHA256, OK: err == nil}
 			if err != nil {
-				e.Error = err.Error()
-				out.fails = append(out.fails, fmt.Sprintf("NOT offloaded: %s\n    %v", it.Path, err))
+				out.fails = append(out.fails, fmt.Sprintf("NOT offloaded: %s\n    %s", display.Text(it.Path), display.Text(err.Error())))
 			} else {
 				out.verified = append(out.verified, res)
 				out.items = append(out.items, it)
-			}
-			if lerr := env.Log.Log(e); lerr != nil {
-				out.fails = append(out.fails, "Operation log: "+lerr.Error())
 			}
 		}
 		return out
@@ -336,29 +327,22 @@ func (m *Model) runRemove(useTrash bool) Cmd {
 		out := removeDoneMsg{trashed: useTrash, before: freeNow(env)}
 		for i, r := range results {
 			if ctx.Err() != nil {
-				out.fails = append(out.fails, "Cancelled; original kept: "+r.Source)
+				out.fails = append(out.fails, "Cancelled; original kept: "+display.Text(r.Source))
 				continue
 			}
 			send(progressMsg(fmt.Sprintf("%d/%d  %s", i+1, len(results), r.Source)))
 			var err error
-			action := "offload-remove-source"
 			if useTrash {
-				action = "offload-trash-source"
-				if err = offload.CheckRemovable(r); err == nil {
+				if err = offload.CheckRemovableContext(ctx, r); err == nil {
 					_, err = env.Trash(r.Source, r.SourceIdentity)
 				}
 			} else {
-				err = offload.RemoveSource(r)
+				err = offload.RemoveSourceContext(ctx, r)
 			}
-			e := oplog.Entry{Action: action, Path: r.Source, Dest: r.Dest, Size: r.Size, SHA256: r.SHA256, OK: err == nil}
 			if err != nil {
-				e.Error = err.Error()
-				out.fails = append(out.fails, fmt.Sprintf("Original kept: %s\n    %v", r.Source, err))
+				out.fails = append(out.fails, fmt.Sprintf("Removal could not complete: %s\n    %s", display.Text(r.Source), display.Text(err.Error())))
 			} else {
 				out.removed = append(out.removed, items[i])
-			}
-			if lerr := env.Log.Log(e); lerr != nil {
-				out.fails = append(out.fails, "Operation log: "+lerr.Error())
 			}
 		}
 		out.after = freeNow(env)

@@ -1,91 +1,42 @@
-// Package trash moves files to the macOS Trash. It never unlinks a file
-// permanently: if no Trash can be used it returns an explanatory error.
+// Package trash moves regular files to same-volume Trash with exclusive,
+// descriptor-relative renames. It never permanently unlinks an original.
 package trash
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"spacehound/internal/fileops"
 	"spacehound/internal/fsid"
+	"spacehound/internal/macosfs"
+	"spacehound/internal/oplog"
+	"spacehound/internal/scan"
 )
 
-// ErrNoTrash means the file's volume has no usable Trash.
 var ErrNoTrash = errors.New("no usable Trash for this file")
 
-// SystemTool is the trash(8) command shipped with macOS 15 and later. It
-// uses the same mechanism as Finder (including "Put Back").
-const SystemTool = "/usr/bin/trash"
-
-// Trasher moves files to the Trash.
 type Trasher struct {
-	Home string
-	// Tool is the path of the system trash command; empty disables it.
-	Tool string
-	// DirFor overrides Trash folder discovery (used by tests and demo mode).
-	DirFor func(path string, dev uint64) (string, error)
-	Now    func() time.Time
+	Home    string
+	Journal *oplog.Logger
+	DirFor  func(string, uint64) (string, error)
+	Now     func() time.Time
+	// move allows deterministic filesystem-failure tests; nil uses the native
+	// atomic exclusive operation. Production never substitutes ordinary rename.
+	move func(*os.File, string, *os.File, string) error
 }
 
-// New returns a Trasher that prefers the system tool when present.
-func New(home string) *Trasher {
-	t := &Trasher{Home: home}
-	if fi, err := os.Stat(SystemTool); err == nil && fi.Mode()&0o111 != 0 {
-		t.Tool = SystemTool
-	}
-	return t
-}
+func New(home string) *Trasher { return &Trasher{Home: home} }
 
-// Result describes a completed move.
 type Result struct {
-	Path   string `json:"path"`
-	Dest   string `json:"dest,omitempty"`
-	Method string `json:"method"`
-}
-
-// Trash re-validates path against the scan identity and moves it to the
-// Trash. It refuses if the file changed.
-func (t *Trasher) Trash(path string, want fsid.Identity) (Result, error) {
-	if !filepath.IsAbs(path) {
-		return Result{}, fmt.Errorf("refusing relative path %q", path)
-	}
-	if err := fsid.Revalidate(path, want); err != nil {
-		return Result{}, err
-	}
-	if t.Tool != "" && t.DirFor == nil {
-		res, err := t.viaTool(path, want)
-		if err == nil {
-			return res, nil
-		}
-		// The tool failed; the file is untouched if it still matches.
-		if verr := fsid.Revalidate(path, want); verr != nil {
-			return Result{}, fmt.Errorf("trash tool failed (%v) and file state is uncertain: %w", err, verr)
-		}
-	}
-	return t.native(path, want)
-}
-
-func (t *Trasher) viaTool(path string, want fsid.Identity) (Result, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	var out bytes.Buffer
-	cmd := exec.CommandContext(ctx, t.Tool, "-s", path)
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Run(); err != nil {
-		return Result{}, fmt.Errorf("%s: %v %s", t.Tool, err, strings.TrimSpace(out.String()))
-	}
-	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
-		return Result{}, fmt.Errorf("%s reported success but %s still exists", t.Tool, path)
-	}
-	return Result{Path: path, Method: "macOS Trash (trash tool; Put Back available in Finder)"}, nil
+	Path         string `json:"path"`
+	Dest         string `json:"dest,omitempty"`
+	RecoveryPath string `json:"recovery_path,omitempty"`
+	Method       string `json:"method"`
 }
 
 func (t *Trasher) now() time.Time {
@@ -94,43 +45,44 @@ func (t *Trasher) now() time.Time {
 	}
 	return time.Now()
 }
-
-// dirFor finds the Trash folder on the same volume as the file.
 func (t *Trasher) dirFor(path string, dev uint64) (string, error) {
 	if t.DirFor != nil {
 		return t.DirFor(path, dev)
 	}
 	home := filepath.Join(t.Home, ".Trash")
-	if id, _, err := fsid.Of(home); err == nil && id.Dev == dev {
-		return home, nil
+	if dir, err := macosfs.OpenDir(home, false, 0); err == nil {
+		id, _, err := fsid.FromOpen(dir)
+		dir.Close()
+		if err == nil && id.Dev == dev {
+			return home, nil
+		}
 	}
 	var st syscall.Statfs_t
 	if err := syscall.Statfs(path, &st); err != nil {
-		return "", fmt.Errorf("%w: cannot identify volume: %v", ErrNoTrash, err)
+		return "", fmt.Errorf("%w: %v", ErrNoTrash, err)
 	}
 	mnt := cString(st.Mntonname[:])
 	if mnt == "" || mnt == "/" {
-		return "", fmt.Errorf("%w: file is on the system volume outside your home Trash", ErrNoTrash)
+		return "", ErrNoTrash
 	}
-	trashes := filepath.Join(mnt, ".Trashes")
-	if _, err := os.Lstat(trashes); err != nil {
-		return "", fmt.Errorf("%w: volume %s has no .Trashes folder (it may be read-only or not support Trash)", ErrNoTrash, mnt)
+	root, err := macosfs.OpenDir(filepath.Join(mnt, ".Trashes"), false, 0)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrNoTrash, err)
 	}
-	dir := filepath.Join(trashes, fmt.Sprint(os.Getuid()))
-	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-		return "", fmt.Errorf("%w: cannot create %s: %v", ErrNoTrash, dir, err)
+	defer root.Close()
+	name := fmt.Sprint(os.Getuid())
+	if err := macosfs.MkdirAt(root, name, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return "", err
 	}
-	return dir, nil
+	return filepath.Join(mnt, ".Trashes", name), nil
 }
-
 func cString(b []int8) string {
-	n := 0
-	for n < len(b) && b[n] != 0 {
-		n++
-	}
-	out := make([]byte, n)
-	for i := 0; i < n; i++ {
-		out[i] = byte(b[i])
+	var out []byte
+	for _, c := range b {
+		if c == 0 {
+			break
+		}
+		out = append(out, byte(c))
 	}
 	return string(out)
 }
@@ -154,60 +106,110 @@ func CandidateName(base string, stamp time.Time, n int) string {
 	return fmt.Sprintf("%s (%s)%s", stem, tag, ext)
 }
 
-func (t *Trasher) native(path string, want fsid.Identity) (Result, error) {
-	dir, err := t.dirFor(path, want.Dev)
+func (t *Trasher) Trash(path string, want fsid.Identity) (Result, error) {
+	res := Result{Path: path}
+	move := t.move
+	if move == nil {
+		move = macosfs.Rename
+	}
+	if !filepath.IsAbs(path) {
+		return res, fmt.Errorf("refusing relative path %q", path)
+	}
+	if why := scan.ProtectedReason(path, t.Home); why != "" {
+		return res, fmt.Errorf("protected source: %s", why)
+	}
+	if err := t.Journal.Check(); err != nil {
+		return res, err
+	}
+	source, err := fileops.OpenRegular(path, &want)
 	if err != nil {
-		return Result{}, err
+		return res, err
 	}
-	did, fi, err := fsid.Of(dir)
+	source.Close()
+	dirPath, err := t.dirFor(path, want.Dev)
 	if err != nil {
-		return Result{}, explain(dir, err)
+		return res, err
 	}
-	if !fi.IsDir() {
-		return Result{}, fmt.Errorf("%w: %s is not a directory", ErrNoTrash, dir)
+	dir, err := macosfs.OpenDir(dirPath, false, 0)
+	if err != nil {
+		return res, fmt.Errorf("%w: %v", ErrNoTrash, err)
 	}
-	if did.Dev != want.Dev {
-		return Result{}, fmt.Errorf("%w: %s is on a different volume; moving would require copying", ErrNoTrash, dir)
+	defer dir.Close()
+	if err := macosfs.MakePrivate(dir, 0o700); err != nil {
+		return res, fmt.Errorf("%w: unsafe per-user Trash: %v", ErrNoTrash, err)
 	}
+	did, fi, err := fsid.FromOpen(dir)
+	if err != nil {
+		return res, err
+	}
+	if !fi.IsDir() || did.Dev != want.Dev {
+		return res, fmt.Errorf("%w: Trash is not on the source filesystem", ErrNoTrash)
+	}
+	capture, err := fileops.Take(path, want, t.Journal, "trash", dirPath)
+	if err != nil {
+		return res, err
+	}
+	defer capture.Close()
 	stamp := t.now()
-	base := filepath.Base(path)
+	capturedID, _, err := fsid.FromOpen(capture.File)
+	if err != nil {
+		return res, capture.Restore(err)
+	}
 	for n := 0; n < 1000; n++ {
-		dest := filepath.Join(dir, CandidateName(base, stamp, n))
-		// Re-check right before the move.
-		if err := fsid.Revalidate(path, want); err != nil {
-			return Result{}, err
+		name := CandidateName(filepath.Base(path), stamp, n)
+		if err := fileops.CheckDir(dir, dirPath); err != nil {
+			return res, capture.Restore(err)
 		}
-		// os.Link fails if dest exists, giving an atomic no-overwrite move.
-		err := os.Link(path, dest)
-		switch {
-		case err == nil:
-			if err := os.Remove(path); err != nil {
-				// Both names exist; nothing lost. Undo the trash link.
-				os.Remove(dest)
-				return Result{}, fmt.Errorf("could not remove original after linking into Trash: %w", err)
-			}
-			return Result{Path: path, Dest: dest, Method: "moved to " + dir}, nil
-		case errors.Is(err, fs.ErrExist):
-			continue
-		case errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.EMLINK) || errors.Is(err, syscall.EXDEV):
-			// Filesystem without hard links: check-then-rename.
-			if _, lerr := os.Lstat(dest); lerr == nil {
+		capture.Entry.Dest = filepath.Join(dirPath, name)
+		if err := t.Journal.Log(capture.Entry); err != nil {
+			return res, capture.Restore(err)
+		}
+		if err := move(capture.Dir, "original", dir, name); err != nil {
+			if errors.Is(err, os.ErrExist) {
 				continue
 			}
-			if err := os.Rename(path, dest); err != nil {
-				return Result{}, explain(dest, err)
-			}
-			return Result{Path: path, Dest: dest, Method: "moved to " + dir}, nil
-		default:
-			return Result{}, explain(dir, err)
+			return res, capture.Restore(err)
 		}
-	}
-	return Result{}, fmt.Errorf("could not find a free name in %s", dir)
-}
+		actual, _ := macosfs.Path(dir)
+		if actual == "" {
+			actual = dirPath
+		}
+		res.Dest = filepath.Join(actual, name)
+		moved, err := macosfs.OpenAt(dir, name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			id, fi, statErr := fsid.FromOpen(moved)
+			moved.Close()
+			err = statErr
+			if err == nil && (!fi.Mode().IsRegular() || !id.SameFile(capturedID) || id.Size != capturedID.Size || id.MtimeNs != capturedID.MtimeNs || id.Nlink != capturedID.Nlink) {
+				err = fmt.Errorf("%w: trashed item changed", fsid.ErrChanged)
+			}
+		}
+		if err == nil {
+			err = fileops.CheckDir(dir, dirPath)
+		}
+		if err == nil {
+			err = dir.Sync()
+		}
+		if err == nil {
+			err = capture.Dir.Sync()
+		}
+		if err != nil {
+			// A shared Trash pathname can be replaced even between an
+			// identity check and rollback. Preserve the descriptor-identified
+			// original instead of ever renaming that pathname back.
+			actual, pathErr := macosfs.Path(capture.File)
+			if pathErr != nil {
+				actual = res.Dest
+			}
+			res.RecoveryPath = actual
+			return res, capture.Preserve(actual, errors.Join(err, pathErr))
+		}
 
-func explain(path string, err error) error {
-	if errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EPERM) {
-		return fmt.Errorf("%w: macOS denied access to %s (%v). Grant your terminal Full Disk Access in System Settings > Privacy & Security, or drag the file to the Trash in Finder. The file was left in place", ErrNoTrash, path, err)
+		res.Method = "moved to " + res.Dest + "; restore manually from this location"
+		if err := capture.Done(); err != nil {
+			return res, fmt.Errorf("moved to %s; journal completion failed: %w", res.Dest, err)
+		}
+		return res, nil
 	}
-	return fmt.Errorf("%w: %v. The file was left in place", ErrNoTrash, err)
+	return res, capture.Restore(errors.New("no free Trash filename"))
 }

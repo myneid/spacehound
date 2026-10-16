@@ -28,8 +28,17 @@ guarantees in [SAFETY.md](SAFETY.md) as a security bug. That includes:
 
 ## Design notes
 
-- Standard library only, with no third-party Go modules.
+- Go standard library plus a small cgo layer calling macOS system libraries;
+  no third-party Go modules. Source builds require Apple's compiler tools.
 - No network access, no telemetry, and no privileged operations. Normal use
   never needs `sudo`.
-- External tools are called by absolute path, with arguments passed
-  directly (no shell): `/usr/bin/ditto` and `/usr/bin/trash`.
+- File changes use held directory/file descriptors, native metadata copying,
+  and exclusive moves. Unsupported filesystem guarantees refuse the action.
+- Offload removal requires complete fresh content/metadata verification,
+  destination synchronization, a durable recovery intent, and runtime-tested
+  guarded unlink on the source filesystem. Close writing applications first;
+  a write that finishes between final verification and deletion can still
+  escape detection. See [SAFETY.md](SAFETY.md) for the limits and recovery flow.
+- Terminal output escapes untrusted control characters. Recovery logs reject
+  symlinks and unsafe ownership/hard links, enforce private permissions and
+  remove extended ACL grants before file-changing operations.

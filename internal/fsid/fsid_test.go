@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -12,6 +13,83 @@ func mustWrite(t *testing.T, p, s string) {
 	t.Helper()
 	if err := os.WriteFile(p, []byte(s), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRevalidateRejectsRestoredMtimeAndMetadataChanges(t *testing.T) {
+	for _, operation := range []string{"rewrite", "permissions", "hardlink"} {
+		t.Run(operation, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "valuable.bin")
+			mustWrite(t, p, "original")
+			id, fi, err := Of(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if id.CtimeNs == 0 {
+				t.Fatal("change time was not captured")
+			}
+			switch operation {
+			case "rewrite":
+				mustWrite(t, p, "replaced")
+				if err := os.Chtimes(p, fi.ModTime(), fi.ModTime()); err != nil {
+					t.Fatal(err)
+				}
+			case "permissions":
+				if err := os.Chmod(p, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "hardlink":
+				if err := os.Link(p, p+"-link"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := Revalidate(p, id); !errors.Is(err, ErrChanged) {
+				t.Fatalf("%s was accepted: %v", operation, err)
+			}
+		})
+	}
+}
+
+type statInfo struct {
+	os.FileInfo
+	st syscall.Stat_t
+}
+
+func (s statInfo) Sys() any { return &s.st }
+
+func TestCheckRejectsChangedLinkCount(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "file")
+	mustWrite(t, p, "hello")
+	id, fi, err := Of(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := *fi.Sys().(*syscall.Stat_t)
+	st.Nlink++
+	if err := Check(statInfo{FileInfo: fi, st: st}, id); !errors.Is(err, ErrChanged) {
+		t.Fatalf("changed link count was accepted: %v", err)
+	}
+}
+
+func TestFromOpenRetainsObjectIdentityAfterRename(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "file")
+	mustWrite(t, p, "hello")
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	want, _, err := FromOpen(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(p, p+"-held"); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, p, "other")
+	got, _, err := FromOpen(f)
+	if err != nil || !got.SameFile(want) {
+		t.Fatalf("descriptor changed identity: %+v error=%v", got, err)
 	}
 }
 

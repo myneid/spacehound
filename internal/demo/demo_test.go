@@ -3,6 +3,7 @@ package demo
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,14 +12,24 @@ import (
 )
 
 func TestDemoFixtureScan(t *testing.T) {
+	t.Setenv("TMPDIR", "/private/var/folders/spacehound-demo-must-not-create")
 	f, err := Build()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Remove()
+	if filepath.Dir(f.Dir) != fixtureRoot {
+		t.Fatalf("fixture outside dedicated temporary root: %s", f.Dir)
+	}
+	if why := scan.ProtectedReason(f.Home, f.Home); why != "" {
+		t.Fatalf("demo fixture protected: %s", why)
+	}
 	rep, err := scan.Run(context.Background(), f.Options(), nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(rep.Items) != 14 || len(rep.Errors) != 0 {
+		t.Fatalf("demo scan incomplete: %d items, %v", len(rep.Items), rep.Errors)
 	}
 	cats := map[model.Category]int{}
 	for _, it := range rep.Items {
@@ -42,6 +53,7 @@ func TestDemoFixtureScan(t *testing.T) {
 		t.Errorf("demo volumes: %+v %v", vols, err)
 	}
 	dir := f.Dir
+	t.Setenv("TMPDIR", "/private/tmp/spacehound-demo-missing-temp-root")
 	if err := f.Remove(); err != nil {
 		t.Fatal(err)
 	}

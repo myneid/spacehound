@@ -12,6 +12,8 @@ permissions:
 jobs:
   test:
     runs-on: macos-latest
+    env:
+      CGO_ENABLED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -20,7 +22,7 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -race ./...
       - run: go build ./...
       - name: Demo smoke test (temporary fixture only)
         run: go run ./cmd/spacehound --demo --json > /dev/null
@@ -28,6 +30,8 @@ jobs:
   build:
     needs: test
     runs-on: macos-latest
+    env:
+      CGO_ENABLED: "1"
     steps:
       - uses: actions/checkout@v4
         with:

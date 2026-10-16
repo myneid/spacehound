@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"spacehound/internal/display"
 	"spacehound/internal/model"
 	"spacehound/internal/offload"
 	"spacehound/internal/units"
@@ -26,12 +27,16 @@ const (
 type seg struct{ style, text string }
 type line []seg
 
-func txt(s string) line                 { return line{{"", s}} }
-func sty(style, s string) line          { return line{{style, s}} }
-func (l line) add(style, s string) line { return append(l, seg{style, s}) }
+func txt(s string) line                 { return line{{"", display.Text(s)}} }
+func sty(style, s string) line          { return line{{style, display.Text(s)}} }
+func (l line) add(style, s string) line { return append(l, seg{style, display.Text(s)}) }
 
 // truncate cuts s to w runes, marking the cut with "…".
 func truncate(s string, w int) string {
+	s = display.Text(s)
+	if w <= 0 {
+		return ""
+	}
 	r := []rune(s)
 	if len(r) <= w {
 		return s
@@ -44,6 +49,10 @@ func truncate(s string, w int) string {
 
 // truncLeft keeps the end of s (useful for paths).
 func truncLeft(s string, w int) string {
+	s = display.Text(s)
+	if w <= 0 {
+		return ""
+	}
 	r := []rune(s)
 	if len(r) <= w {
 		return s
@@ -55,6 +64,7 @@ func truncLeft(s string, w int) string {
 }
 
 func pad(s string, w int) string {
+	s = display.Text(s)
 	n := len([]rune(s))
 	if n >= w {
 		return truncate(s, w)
@@ -64,6 +74,7 @@ func pad(s string, w int) string {
 
 // wrap breaks text into lines of at most w runes at spaces.
 func wrap(s string, w int) []string {
+	s = display.Text(s)
 	if w < 10 {
 		w = 10
 	}
@@ -415,8 +426,8 @@ func (m *Model) viewConfirmTrash(add func(line, string), w int) {
 	add(txt(""), "")
 	add(txt(fmt.Sprintf(" %s, %s logical, likely frees %s once the Trash is emptied (%s).",
 		plural(len(m.targets), "item"), units.FormatSize(size), units.FormatSize(likely), riskCounts(m.targets))), "")
-	add(txt(" Each file is re-checked (device, inode, size, mtime) right before moving; changed files are skipped."), "")
-	add(txt(" Nothing is deleted permanently. Use Finder's \"Put Back\" to restore."), "")
+	add(txt(" Each file's identity, size, modification/change times and link count are checked; changed files are skipped."), "")
+	add(txt(" Nothing is deleted permanently. Restore manually from the Trash using the original paths in the operation log."), "")
 	for _, wn := range m.dupWarnings(m.targets) {
 		add(sty(sRed+sBold, " "+wn), "")
 	}
@@ -478,7 +489,7 @@ func (m *Model) viewConfirmOffload(add func(line, string), w int) {
 	add(sty(sBold, " Offload to "+v.Name), "")
 	add(txt(""), "")
 	add(txt(fmt.Sprintf(" %s, %s. %s has %s free.", plural(len(m.targets), "file"), units.FormatSize(total), v.Name, units.FormatSize(v.Free))), "")
-	add(txt(" Steps: copy with ditto (keeps metadata) → verify type, size and SHA-256 → re-check the original."), "")
+	add(txt(" Steps: native copy of contents and metadata → verify both completely → re-check the original."), "")
 	add(txt(" Existing files on the drive are never overwritten. Originals stay until you confirm again."), "")
 	add(txt(fmt.Sprintf(" Removing the originals afterwards would likely free %s on the internal disk.", units.FormatSize(likely))), "")
 	add(txt(""), "")
@@ -518,6 +529,7 @@ func (m *Model) viewConfirmRemove(add func(line, string), w int) {
 	}
 	add(txt(""), "")
 	add(txt(" The originals are still on the internal disk. Choose what to do with them:"), "")
+	add(sty(sYellow, " Close apps that may write these files before removing originals; in-flight writes can escape detection."), "")
 	add(txt("   ").add(sBold+sYellow, WordRemove).add("", "  delete the originals now (the verified copies on "+m.chosenVol.Name+" remain)"), "")
 	add(txt("   ").add(sBold+sYellow, WordTrash).add("", "   move the originals to the Trash instead"), "")
 	add(txt("   Esc     keep both (nothing else changes)"), "")
